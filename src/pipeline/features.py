@@ -1,0 +1,255 @@
+"""Stage 4: pairwise features for (Source 1, candidate) pairs.
+
+Feature groups
+  * blocking signals : combined cosine, ranks in both search directions,
+                       margins to the best owner / best target
+  * encoder fields   : name-vector and address-vector cosine
+  * string similarity: RapidFuzz ratios on normalised, core (legal-form
+                       stripped) and squashed (transliteration-robust) names,
+                       and on addresses
+  * numbers          : house numbers / ZIP / PIN agreement in addresses
+  * context          : candidate counts, missing-field flags, target source
+
+Nothing here depends on the country label, so the model transfers to
+countries that are absent from training (France).
+"""
+
+import re
+
+import numpy as np
+import pandas as pd
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler
+
+from pipeline.common import core_name, emb_path, prep_path, squash
+
+PAIR_CHUNK = 2_000_000
+
+# Final blocking cut-off applied to the saved search results
+# (chosen on the training holdout with `python -m pipeline.block eval`).
+KEEP_A = 1
+KEEP_B = 5
+
+
+def filter_candidates(cand):
+    """Apply the final blocking cut-off and add candidate-count features.
+
+    Counts are computed here, on the complete candidate table, so they stay
+    correct when a subset of pairs is featurised later.
+    """
+    cand = cand[(cand["rank_a"] < KEEP_A) | (cand["rank_b"] < KEEP_B)].reset_index(drop=True)
+    cand["n_cand_s1"] = cand.groupby("s1")["tgt"].transform("size").astype(np.float32)
+    cand["n_cand_tgt"] = cand.groupby("tgt")["s1"].transform("size").astype(np.float32)
+    return cand
+
+
+class Records:
+    """Normalised strings + embeddings of one side (S1 or targets)."""
+
+    def __init__(self, split, sources):
+        frames = [pd.read_parquet(prep_path(split, s)) for s in sources]
+        self.sizes = [len(f) for f in frames]
+        df = pd.concat(frames, ignore_index=True)
+        del frames
+        self.ids = df["entity_id"].to_numpy(dtype=object)
+        self.name = df["name_n"].to_numpy(dtype=object)
+        self.addr = df["addr_n"].to_numpy(dtype=object)
+        self.country = df["country"].to_numpy(dtype=object)  # reporting only, never a feature
+        del df
+        self.embs = [np.load(emb_path(split, s), mmap_mode="r") for s in sources]
+        self.source = np.concatenate([np.full(n, i, dtype=np.int8) for i, n in enumerate(self.sizes)])
+        self._idf = None
+        self._addr_idf = None
+
+    @property
+    def idf(self):
+        if self._idf is None:
+            self._idf = token_idf(self.name, core_tokens)
+        return self._idf
+
+    @property
+    def addr_idf(self):
+        if self._addr_idf is None:
+            self._addr_idf = token_idf(self.addr, addr_tokens)
+        return self._addr_idf
+
+    @property
+    def idf_default(self):
+        """IDF of a token seen once (unseen tokens are treated as rarest)."""
+        return float(np.log(len(self.name)))
+
+    def emb(self, rows):
+        out = np.empty((len(rows), self.embs[0].shape[1]), dtype=np.float32)
+        start = 0
+        for e in self.embs:
+            mask = (rows >= start) & (rows < start + len(e))
+            if mask.any():
+                sub = rows[mask] - start
+                order = np.argsort(sub)
+                block = np.asarray(e[sub[order]], dtype=np.float32)
+                tmp = np.empty_like(block)
+                tmp[order] = block
+                out[mask] = tmp
+            start += len(e)
+        return out
+
+
+_DIGITS = re.compile(r"\d+")
+
+
+def _numbers(addr):
+    """Digit runs with leading zeros stripped ("0069" == "69", "8c" -> "8")."""
+    return {d.lstrip("0") or "0" for d in _DIGITS.findall(addr)}
+
+
+def _postcode(addr):
+    """Trailing 5/6-digit token (US ZIP / French code postal / Indian PIN).
+
+    Only the last number in the address counts, and never the first token,
+    so a zero-padded house number ("05131 copper meadow lane") is not
+    mistaken for a postcode.
+    """
+    tokens = addr.split()
+    for pos in range(len(tokens) - 1, 0, -1):
+        if tokens[pos].isdigit():
+            return tokens[pos] if len(tokens[pos]) in (5, 6) else ""
+    return ""
+
+
+def _num_diff(x, y):
+    """Smallest |a - b| between numbers found on only one side (-1 if none).
+
+    Near-duplicate decoys often share the street but differ by a few house
+    numbers (4747 vs 4749), which a plain "any number in common" misses.
+    """
+    ox, oy = x - y, y - x
+    if not ox or not oy:
+        return -1.0
+    return float(min(abs(int(a[:12]) - int(b[:12])) for a in ox for b in oy))
+
+
+def core_tokens(name):
+    return core_name(name).split()
+
+
+def addr_tokens(addr):
+    """Address words without numbers (street / locality words)."""
+    return [t for t in addr.split() if not any(ch.isdigit() for ch in t)]
+
+
+def token_idf(texts, tokenize):
+    """log(N / df) of tokens, computed on the records being matched."""
+    df = {}
+    for text in texts:
+        for t in set(tokenize(text)):
+            df[t] = df.get(t, 0) + 1
+    n = len(texts)
+    return {t: float(np.log(n / c)) for t, c in df.items()}
+
+
+def _idf_diff(k1, k2, idf, default):
+    """IDF mass of core-name tokens shared / not shared by the two names."""
+    common, diff, diff_max = [], [], []
+    for a, b in zip(k1, k2):
+        ta, tb = set(a.split()), set(b.split())
+        c = sum(idf.get(t, default) for t in ta & tb)
+        d = [idf.get(t, default) for t in ta ^ tb]
+        common.append(c)
+        diff.append(sum(d))
+        diff_max.append(max(d) if d else 0.0)
+    return (np.array(common, np.float32), np.array(diff, np.float32),
+            np.array(diff_max, np.float32))
+
+
+def _pairwise(scorer, a, b):
+    return process.cpdist(list(a), list(b), scorer=scorer, workers=-1).astype(np.float32) / 100.0
+
+
+def _chunk_features(s1, tg, c):
+    i = c["s1"].to_numpy()
+    j = c["tgt"].to_numpy()
+    f = {}
+
+    # Blocking signals
+    f["cos"] = c["cos"].to_numpy()
+    f["rank_a"] = c["rank_a"].to_numpy().astype(np.float32)
+    f["rank_b"] = c["rank_b"].to_numpy().astype(np.float32)
+    f["t_top1"] = c["t_top1"].to_numpy()
+    f["t_top2"] = c["t_top2"].to_numpy()
+    f["s_top1"] = c["s_top1"].to_numpy()
+    f["margin_owner"] = f["cos"] - f["t_top1"]
+    f["margin_s1"] = f["cos"] - f["s_top1"]
+    f["owner_gap"] = f["t_top1"] - f["t_top2"]
+
+    # Encoder field cosines
+    e1 = s1.emb(i)
+    e2 = tg.emb(j)
+    half = e1.shape[1] // 2
+    f["name_cos"] = (e1[:, :half] * e2[:, :half]).sum(1)
+    f["addr_cos"] = (e1[:, half:] * e2[:, half:]).sum(1)
+
+    # String similarity
+    n1, n2 = s1.name[i], tg.name[j]
+    k1 = np.array([core_name(x) for x in n1], dtype=object)
+    k2 = np.array([core_name(x) for x in n2], dtype=object)
+    q1 = [squash(x) for x in n1]
+    q2 = [squash(x) for x in n2]
+    a1, a2 = s1.addr[i], tg.addr[j]
+    f["name_ratio"] = _pairwise(fuzz.ratio, n1, n2)
+    f["name_token_set"] = _pairwise(fuzz.token_set_ratio, n1, n2)
+    f["name_token_sort"] = _pairwise(fuzz.token_sort_ratio, n1, n2)
+    f["name_partial"] = _pairwise(fuzz.partial_ratio, n1, n2)
+    f["core_ratio"] = _pairwise(fuzz.ratio, k1, k2)
+    f["core_token_set"] = _pairwise(fuzz.token_set_ratio, k1, k2)
+    f["core_jw"] = process.cpdist(list(k1), list(k2), scorer=JaroWinkler.similarity, workers=-1).astype(np.float32)
+    f["squash_ratio"] = _pairwise(fuzz.ratio, q1, q2)
+    f["addr_ratio"] = _pairwise(fuzz.ratio, a1, a2)
+    f["addr_token_set"] = _pairwise(fuzz.token_set_ratio, a1, a2)
+    f["addr_partial"] = _pairwise(fuzz.partial_ratio, a1, a2)
+    f["core_exact"] = (k1 == k2).astype(np.float32)
+    f["idf_common"], f["idf_diff"], f["idf_diff_max"] = _idf_diff(k1, k2, tg.idf, tg.idf_default)
+    f["idf_diff_ratio"] = f["idf_diff"] / (f["idf_common"] + f["idf_diff"] + 1e-6)
+    w1 = np.array([" ".join(addr_tokens(x)) for x in a1], dtype=object)
+    w2 = np.array([" ".join(addr_tokens(x)) for x in a2], dtype=object)
+    f["addr_idf_common"], f["addr_idf_diff"], f["addr_idf_diff_max"] = _idf_diff(
+        w1, w2, tg.addr_idf, tg.idf_default)
+    f["addr_idf_diff_ratio"] = f["addr_idf_diff"] / (f["addr_idf_common"] + f["addr_idf_diff"] + 1e-6)
+
+    # Numbers in the address
+    num1 = [_numbers(x) for x in a1]
+    num2 = [_numbers(x) for x in a2]
+    inter = np.fromiter((len(x & y) for x, y in zip(num1, num2)), np.float32, len(i))
+    union = np.fromiter((len(x | y) for x, y in zip(num1, num2)), np.float32, len(i))
+    f["num_jaccard"] = np.where(union > 0, inter / np.maximum(union, 1), -1)
+    f["num_conflict"] = ((inter == 0) & (union > 0) & np.fromiter(
+        (bool(x) and bool(y) for x, y in zip(num1, num2)), bool, len(i))).astype(np.float32)
+    f["num_only1"] = np.fromiter((len(x - y) for x, y in zip(num1, num2)), np.float32, len(i))
+    f["num_only2"] = np.fromiter((len(y - x) for x, y in zip(num1, num2)), np.float32, len(i))
+    f["num_min_diff"] = np.log1p(np.fromiter(
+        (_num_diff(x, y) for x, y in zip(num1, num2)), np.float64, len(i)).clip(-1 + 1e-9)).astype(np.float32)
+    p1 = np.array([_postcode(x) for x in a1], dtype=object)
+    p2 = np.array([_postcode(x) for x in a2], dtype=object)
+    f["postcode"] = np.where((p1 == "") | (p2 == ""), -1, (p1 == p2).astype(np.float32)).astype(np.float32)
+
+    # Context
+    f["name_len1"] = np.fromiter((len(x) for x in n1), np.float32, len(i))
+    f["name_len2"] = np.fromiter((len(x) for x in n2), np.float32, len(i))
+    f["addr_len1"] = np.fromiter((len(x) for x in a1), np.float32, len(i))
+    f["addr_len2"] = np.fromiter((len(x) for x in a2), np.float32, len(i))
+    f["target_source"] = tg.source[j].astype(np.float32)
+    return pd.DataFrame(f)
+
+
+def iter_features(s1, tg, cand):
+    """Yield (start, features) chunks for the rows of `cand` (from filter_candidates)."""
+    for start in range(0, len(cand), PAIR_CHUNK):
+        c = cand.iloc[start:start + PAIR_CHUNK]
+        feats = _chunk_features(s1, tg, c)
+        feats["n_cand_s1"] = c["n_cand_s1"].to_numpy()
+        feats["n_cand_tgt"] = c["n_cand_tgt"].to_numpy()
+        print(f"  features {min(start + PAIR_CHUNK, len(cand)):,}/{len(cand):,}", flush=True)
+        yield start, feats
+
+
+def build_features(s1, tg, cand):
+    return pd.concat([f for _, f in iter_features(s1, tg, cand)], ignore_index=True)

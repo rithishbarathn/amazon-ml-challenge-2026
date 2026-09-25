@@ -6,3 +6,5 @@ dataset/
 output/
 .env
 .vscode/
+work/
+output_*/
