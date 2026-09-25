@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from pipeline.block import cand_path
+from pipeline.block import load_candidates
 from pipeline.common import DATA_DIR, OUTPUT_DIR, WORK_DIR, bucket, prep_path
 from pipeline.features import Records, build_features, filter_candidates, iter_features
 
@@ -129,7 +129,7 @@ def train():
     tg = Records("train", ["source2", "source3"])
     print(f"records loaded ({time.time() - start:.0f}s)", flush=True)
     positives, n_true = load_truth(s1.ids, tg.ids)
-    cand = filter_candidates(pd.read_parquet(cand_path("train")))
+    cand = filter_candidates(load_candidates("train"))
     print(f"train candidates: {len(cand):,}", flush=True)
 
     rng = np.random.default_rng(0)
@@ -169,7 +169,7 @@ def train():
     model.save_model(MODEL_PATH)
 
     # Keep holdout predictions so decision rules can be re-tuned without retraining.
-    ho.assign(p=prob, y=y_ho)[["s1", "tgt", "rank_a", "rank_b", "p", "y"]].to_parquet(HOLDOUT_PRED)
+    ho.assign(p=prob, y=y_ho)[["s1", "tgt", "rank_a", "rank_b", "rank_c", "p", "y"]].to_parquet(HOLDOUT_PRED)
     np.save(HOLDOUT_QUERIES_PATH, hold_q)
     CONFIG_PATH.write_text(json.dumps({"features": list(X_tr.columns)}, indent=2))
     print(f"saved model ({time.time() - start:.0f}s)")
@@ -210,12 +210,15 @@ def tune(s1=None, tg=None, positives=None, n_true=None):
               f"macro F0.5 {macro_f05(q, n_true, pred, positives):.4f}")
 
     # Smaller candidate sets (organisers rank smaller sets higher).
+    rank_c = ho["rank_c"] if "rank_c" in ho else pd.Series(99, index=ho.index)
     for kb in (0, 3, 5):
-        sub = ho[(ho["rank_a"] < 1) | (ho["rank_b"] < kb)]
-        keep = ((ho["rank_a"] < 1) | (ho["rank_b"] < kb)).to_numpy()
-        n_c = sub.loc[sub["s1"].isin(hold_q)].shape[0] / len(hold_q)
-        score = macro_f05(hold_q, n_true, decide(sub, prob[keep], best_rule), positives)
-        print(f"  candidates rank_a<1 | rank_b<{kb}: {n_c:.2f}/S1 -> macro F0.5 {score:.4f}")
+        for use_c in (False, True):
+            keep = ((ho["rank_a"] < 1) | (ho["rank_b"] < kb) | (use_c & (rank_c < 1))).to_numpy()
+            sub = ho[keep]
+            n_c = sub["s1"].isin(hold_q).sum() / len(hold_q)
+            score = macro_f05(hold_q, n_true, decide(sub, prob[keep], best_rule), positives)
+            print(f"  candidates rank_a<1 | rank_b<{kb}{' | rank_c<1' if use_c else ''}: "
+                  f"{n_c:.2f}/S1 -> macro F0.5 {score:.4f}")
 
     config = json.loads(CONFIG_PATH.read_text())
     config.update({"rule": best_rule, "holdout_f05": best_score})
@@ -265,7 +268,7 @@ def predict():
 
     s1 = Records("test", ["source1"])
     tg = Records("test", ["source2", "source3"])
-    cand = filter_candidates(pd.read_parquet(cand_path("test")))
+    cand = filter_candidates(load_candidates("test"))
     print(f"test candidates: {len(cand):,} ({len(cand) / len(s1.ids):.2f} per S1)", flush=True)
 
     if len(sys.argv) > 2 and sys.argv[2] == "--reuse-prob":

@@ -17,6 +17,7 @@ chosen on the training data without re-running the search.
 Usage (from src/):
     python -m pipeline.block train|test
     python -m pipeline.block eval          # recall vs size on train holdout
+    python -m pipeline.block addr train|test   # add the address-only channel
 """
 
 import sys
@@ -176,6 +177,110 @@ def run(split):
 
 
 # --------------------------------------------------------------------------
+# Address-only channel
+#
+# Some Source 2/3 records carry a completely different trade name (a DBA,
+# a web domain, ...) but the same address as their Source 1 owner. Their
+# combined name+address vector is far from the owner, so every target also
+# proposes its K_C closest Source 1 entities by address alone.
+# --------------------------------------------------------------------------
+
+K_C = 2
+ADDR_ONLY_W = 1000.0   # address weight that makes the combined vector address-only
+
+
+def full_cand_path(split):
+    return WORK_DIR / "cand" / f"{split}_candidates_full.parquet"
+
+
+def load_candidates(split):
+    """Candidate table incl. the address channel when it has been computed."""
+    path = full_cand_path(split)
+    return pd.read_parquet(path if path.exists() else cand_path(split))
+
+
+@torch.no_grad()
+def search_targets(zs, target_chunks, k):
+    """Every target -> its top k Source 1 rows (local indices)."""
+    k = min(k, zs.shape[0])
+    batch = max(64, SCORE_BUDGET // zs.shape[0])
+    s_out, t_out, v_out = [], [], []
+    for offset, zt in target_chunks:
+        for i in range(0, zt.shape[0], batch):
+            v, idx = (zt[i:i + batch] @ zs.T).topk(k, dim=1)
+            s_out.append(idx.cpu().numpy())
+            v_out.append(v.float().cpu().numpy())
+            t_out.append(np.arange(offset + i, offset + i + len(idx)))
+        del zt
+    s = np.concatenate(s_out)
+    return (s.ravel(), np.repeat(np.concatenate(t_out), k),
+            np.concatenate(v_out).ravel(), np.tile(np.arange(k), len(s)))
+
+
+@torch.no_grad()
+def pair_cos(s1_embs, tg_embs, s_rows, t_rows, addr_w, chunk=1_000_000):
+    """Combined-vector cosine of explicit (S1, target) row pairs."""
+    out = np.empty(len(s_rows), dtype=np.float32)
+    for i in range(0, len(s_rows), chunk):
+        a = to_combined(gather(s1_embs, s_rows[i:i + chunk]), addr_w).float()
+        b = to_combined(gather(tg_embs, t_rows[i:i + chunk]), addr_w).float()
+        out[i:i + chunk] = (a * b).sum(1).cpu().numpy()
+    return out
+
+
+def run_addr(split):
+    start = time.time()
+    addr_w = load_encoder().log_addr_w.exp().item()
+    s1_meta, s1_embs = load_side(split, ["source1"])
+    tg_meta, tg_embs = load_side(split, ["source2", "source3"])
+    frames = []
+    for country in sorted(s1_meta["country"].unique()):
+        s_rows = np.flatnonzero(s1_meta["country"].to_numpy() == country)
+        t_rows = np.flatnonzero(tg_meta["country"].to_numpy() == country)
+        if len(t_rows) == 0:
+            continue
+        t0 = time.time()
+        zs = to_combined(gather(s1_embs, s_rows), ADDR_ONLY_W)
+        chunks = (
+            (i, to_combined(gather(tg_embs, t_rows[i:i + TARGET_CHUNK]), ADDR_ONLY_W))
+            for i in range(0, len(t_rows), TARGET_CHUNK)
+        )
+        cs, ct, cv, cr = search_targets(zs, chunks, K_C)
+        del zs
+        torch.cuda.empty_cache()
+        frames.append(pd.DataFrame({
+            "s1": s_rows[cs].astype(np.int32), "tgt": t_rows[ct].astype(np.int32),
+            "addr_nn_cos": cv.astype(np.float32), "rank_c": cr.astype(np.int8),
+        }))
+        print(f"  {country}: address channel in {time.time() - t0:.0f}s", flush=True)
+    c = pd.concat(frames, ignore_index=True)
+
+    cand = pd.read_parquet(cand_path(split))
+    key_c = (c["s1"].to_numpy().astype(np.int64) << 32) | c["tgt"].to_numpy()
+    key_a = (cand["s1"].to_numpy().astype(np.int64) << 32) | cand["tgt"].to_numpy()
+    pos = pd.Series(np.arange(len(c)), index=key_c).reindex(key_a).to_numpy()
+    hit = ~np.isnan(pos)
+    idx = pos[hit].astype(np.int64)
+    cand["rank_c"] = np.int8(NO_RANK)
+    cand.loc[hit, "rank_c"] = c["rank_c"].to_numpy()[idx]
+    cand["addr_nn_cos"] = np.float32(np.nan)
+    cand.loc[hit, "addr_nn_cos"] = c["addr_nn_cos"].to_numpy()[idx]
+
+    # Pairs found only by the address channel: fill the blocking signals.
+    new = c[~np.isin(key_c, key_a)].reset_index(drop=True)
+    new["cos"] = pair_cos(s1_embs, tg_embs, new["s1"].to_numpy(), new["tgt"].to_numpy(), addr_w)
+    new["rank_a"] = np.int8(NO_RANK)
+    new["rank_b"] = np.int8(NO_RANK)
+    t_stats = cand.drop_duplicates("tgt")[["tgt", "t_top1", "t_top2"]]
+    s_stats = cand.drop_duplicates("s1")[["s1", "s_top1"]]
+    new = new.merge(t_stats, on="tgt", how="left").merge(s_stats, on="s1", how="left")
+    cand = pd.concat([cand, new[cand.columns]], ignore_index=True)
+    cand.to_parquet(full_cand_path(split), index=False)
+    print(f"address channel: {len(c):,} pairs, {len(new):,} new; saved {len(cand):,} "
+          f"to {full_cand_path(split)} in {time.time() - start:.0f}s", flush=True)
+
+
+# --------------------------------------------------------------------------
 # Recall / size trade-off on the training holdout bucket
 # --------------------------------------------------------------------------
 
@@ -221,4 +326,9 @@ def evaluate():
 
 if __name__ == "__main__":
     arg = sys.argv[1]
-    evaluate() if arg == "eval" else run(arg)
+    if arg == "eval":
+        evaluate()
+    elif arg == "addr":
+        run_addr(sys.argv[2])
+    else:
+        run(arg)

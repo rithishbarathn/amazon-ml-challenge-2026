@@ -29,6 +29,7 @@ PAIR_CHUNK = 2_000_000
 # (chosen on the training holdout with `python -m pipeline.block eval`).
 KEEP_A = 1
 KEEP_B = 5
+KEEP_C = 1   # address-only channel (pipeline.block addr); ignored if not computed
 
 
 def filter_candidates(cand):
@@ -37,7 +38,10 @@ def filter_candidates(cand):
     Counts are computed here, on the complete candidate table, so they stay
     correct when a subset of pairs is featurised later.
     """
-    cand = cand[(cand["rank_a"] < KEEP_A) | (cand["rank_b"] < KEEP_B)].reset_index(drop=True)
+    if "rank_c" not in cand:
+        cand = cand.assign(rank_c=np.int8(99), addr_nn_cos=np.float32(np.nan))
+    keep = (cand["rank_a"] < KEEP_A) | (cand["rank_b"] < KEEP_B) | (cand["rank_c"] < KEEP_C)
+    cand = cand[keep].reset_index(drop=True)
     cand["n_cand_s1"] = cand.groupby("s1")["tgt"].transform("size").astype(np.float32)
     cand["n_cand_tgt"] = cand.groupby("tgt")["s1"].transform("size").astype(np.float32)
     return cand
@@ -174,6 +178,8 @@ def _chunk_features(s1, tg, c):
     f["cos"] = c["cos"].to_numpy()
     f["rank_a"] = c["rank_a"].to_numpy().astype(np.float32)
     f["rank_b"] = c["rank_b"].to_numpy().astype(np.float32)
+    f["rank_c"] = c["rank_c"].to_numpy().astype(np.float32)
+    f["addr_nn_cos"] = c["addr_nn_cos"].to_numpy().astype(np.float32)
     f["t_top1"] = c["t_top1"].to_numpy()
     f["t_top2"] = c["t_top2"].to_numpy()
     f["s_top1"] = c["s_top1"].to_numpy()
