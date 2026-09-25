@@ -153,7 +153,7 @@ def train():
     # Early-stopping split grouped by S1.
     valid_mask = np.isin(tr["s1"].to_numpy(), train_q[: len(train_q) // 10])
     model = xgb.XGBClassifier(
-        n_estimators=6000, learning_rate=0.05, max_depth=8, min_child_weight=5,
+        n_estimators=12000, learning_rate=0.03, max_depth=10, min_child_weight=5,
         subsample=0.8, colsample_bytree=0.8, tree_method="hist", device="cuda",
         eval_metric="logloss", early_stopping_rounds=50, random_state=0,
     )

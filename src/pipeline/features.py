@@ -28,7 +28,7 @@ PAIR_CHUNK = 2_000_000
 # Final blocking cut-off applied to the saved search results
 # (chosen on the training holdout with `python -m pipeline.block eval`).
 KEEP_A = 1
-KEEP_B = 5
+KEEP_B = 3
 KEEP_C = 1   # address-only channel (pipeline.block addr); ignored if not computed
 
 
