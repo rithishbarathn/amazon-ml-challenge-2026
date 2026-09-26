@@ -1,0 +1,10 @@
+time,experiment,phase,encoder_config,feature_groups,n_features,depth,learning_rate,other_params,threshold,inner_f05,holdout_f05,us_f05,india_f05,india_transfer_f05,france_proxy,block_recall,addr_channel_recall,candidates_per_s1,notes
+2026-09-26 13:34,encoder_v6_baseline,1-encoder,v6_baseline,,,,,,,,,,,,,0.9703,,,owner@1 all / target@5 all / per country owner@1: India 0.9658/0.9189; US 0.9733/0.9325; target@5 0.9270
+2026-09-26 13:45,encoder_a_alldata,1-encoder,a_alldata,,,,,,,,,,,,,0.9741,,,owner@1 all / target@5 all / per country owner@1: India 0.9698/0.9247; US 0.9770/0.9379; target@5 0.9326
+2026-09-26 13:55,encoder_b_alldata_hard,1-encoder,b_alldata_hard,,,,,,,,,,,,,0.9731,,,owner@1 all / target@5 all / per country owner@1: India 0.9706/0.9249; US 0.9748/0.9365; target@5 0.9319
+2026-09-26 14:09,encoder_c_alldata_hard_d128_e6,1-encoder,c_alldata_hard_d128_e6,,,,,,,,,,,,,0.9738,,,owner@1 all / target@5 all / per country owner@1: India 0.9713/0.9249; US 0.9754/0.9361; target@5 0.9316
+2026-09-26 14:16,features_base,3-features,v6,base,46,8,0.0500,"{""n_estimators"": 6000, ""min_child_weight"": 5, ""subsample"": 0.8, ""colsample_bytree"": 0.8}",0.7500,0.9843,,0.9864,,0.9352,,,,,
+2026-09-26 14:22,features_A,3-features,v6,A,51,8,0.0500,"{""n_estimators"": 6000, ""min_child_weight"": 5, ""subsample"": 0.8, ""colsample_bytree"": 0.8}",0.7250,0.9848,,0.9866,,0.9348,,,,,
+2026-09-26 14:30,features_B,3-features,v6,B,51,8,0.0500,"{""n_estimators"": 6000, ""min_child_weight"": 5, ""subsample"": 0.8, ""colsample_bytree"": 0.8}",0.7000,0.9848,,0.9866,,0.9441,,,,,
+2026-09-26 14:38,features_C,3-features,v6,C,50,8,0.0500,"{""n_estimators"": 6000, ""min_child_weight"": 5, ""subsample"": 0.8, ""colsample_bytree"": 0.8}",0.7250,0.9845,,0.9866,,0.9317,,,,,
+2026-09-26 14:46,features_A+B,3-features,v6,A+B,56,8,0.0500,"{""n_estimators"": 6000, ""min_child_weight"": 5, ""subsample"": 0.8, ""colsample_bytree"": 0.8}",0.7000,0.9853,,0.9869,,0.9461,,,,,

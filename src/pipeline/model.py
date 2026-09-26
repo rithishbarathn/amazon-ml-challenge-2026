@@ -1,5 +1,8 @@
 """Encoder network: two sparse EmbeddingBag layers (name, address)."""
 
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,8 +11,10 @@ import torch.nn.functional as F
 from pipeline.common import WORK_DIR
 from pipeline.textvec import N_FEATURES
 
-DIM = 96                      # per field -> stored vector is 2 * DIM
-MODEL_PATH = WORK_DIR / "encoder.pt"
+# Per-field dimension (stored vector is 2 * DIM) and checkpoint path; both can be
+# overridden for encoder experiments (ER_ENC_DIM / ER_ENC_PATH).
+DIM = int(os.environ.get("ER_ENC_DIM", 96))
+MODEL_PATH = Path(os.environ.get("ER_ENC_PATH", WORK_DIR / "encoder.pt"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --------------------------------------------------------------------------
@@ -18,10 +23,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Encoder(nn.Module):
 
-    def __init__(self):
+    def __init__(self, dim=DIM):
         super().__init__()
-        self.name_bag = nn.EmbeddingBag(N_FEATURES, DIM, mode="sum", sparse=True)
-        self.addr_bag = nn.EmbeddingBag(N_FEATURES, DIM, mode="sum", sparse=True)
+        self.name_bag = nn.EmbeddingBag(N_FEATURES, dim, mode="sum", sparse=True)
+        self.addr_bag = nn.EmbeddingBag(N_FEATURES, dim, mode="sum", sparse=True)
         nn.init.normal_(self.name_bag.weight, std=0.1)
         nn.init.normal_(self.addr_bag.weight, std=0.1)
         # Relative weight of the address in the combined vector, and the
@@ -50,9 +55,10 @@ def combine(name, addr, addr_w):
     return F.normalize(torch.cat([name, addr * addr_w], dim=1), dim=1)
 
 
-def load_encoder():
-    model = Encoder().to(DEVICE)
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+def load_encoder(path=None):
+    state = torch.load(path or MODEL_PATH, map_location=DEVICE)
+    model = Encoder(dim=state["name_bag.weight"].shape[1]).to(DEVICE)
+    model.load_state_dict(state)
     model.eval()
     return model
 

@@ -20,12 +20,17 @@ import re
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, Levenshtein
 
 from pipeline.common import core_name, emb_path, prep_path, squash
 from pipeline.mlemb import mlemb_path
 
 PAIR_CHUNK = 2_000_000
+
+# Optional feature groups (experiments; ER_FEATURE_GROUPS="A,B,C"):
+#   A number decoys, B name structure, C acronym / domain names.
+FEATURE_GROUPS = set(filter(None, os.environ.get("ER_FEATURE_GROUPS", "").split(",")))
+DOMAIN_TOKENS = {"com", "net", "org", "in", "co", "fr", "biz", "info", "io"}
 
 # Final blocking cut-off applied to the saved search results
 # (chosen on the training holdout with `python -m pipeline.block eval`).
@@ -179,6 +184,72 @@ def _idf_diff(k1, k2, idf, default):
             np.array(diff_max, np.float32))
 
 
+def _ordered_numbers(addr):
+    return [d.lstrip("0") or "0" for d in _DIGITS.findall(addr)]
+
+
+def _number_decoy_features(a1, a2):
+    """Group A: truncated / split numbers (102 vs 10, 133 vs 33, "3 05" vs 305)."""
+    n = len(a1)
+    prefix = np.zeros(n, np.float32)
+    split = np.zeros(n, np.float32)
+    first_eq = np.full(n, -1, np.float32)
+    cnt1 = np.zeros(n, np.float32)
+    cnt2 = np.zeros(n, np.float32)
+    for k, (x, y) in enumerate(zip(a1, a2)):
+        lx, ly = _ordered_numbers(x), _ordered_numbers(y)
+        cnt1[k], cnt2[k] = len(lx), len(ly)
+        if lx and ly:
+            first_eq[k] = float(lx[0] == ly[0])
+        sx, sy = set(lx), set(ly)
+        ox, oy = sx - sy, sy - sx
+        prefix[k] = float(any(a != b and (a.startswith(b) or b.startswith(a) or a.endswith(b) or b.endswith(a))
+                              for a in ox for b in oy))
+        rx, ry = _DIGITS.findall(x), _DIGITS.findall(y)   # raw digits: "3" + "05" -> "305"
+        jx = {(rx[i] + rx[i + 1]).lstrip("0") for i in range(len(rx) - 1)}
+        jy = {(ry[i] + ry[i + 1]).lstrip("0") for i in range(len(ry) - 1)}
+        split[k] = float(bool(jx & oy) or bool(jy & ox))
+    return {"num_prefix": prefix, "num_split_match": split, "num_first_eq": first_eq,
+            "num_count1": cnt1, "num_count2": cnt2}
+
+
+def _name_structure_features(k1, k2):
+    """Group B: edit distance and token structure of the core names."""
+    t1 = [x.split() for x in k1]
+    t2 = [x.split() for x in k2]
+    return {
+        "core_lev": process.cpdist(list(k1), list(k2), scorer=Levenshtein.normalized_similarity,
+                                   workers=-1).astype(np.float32),
+        "first_tok_eq": np.fromiter((float(bool(a) and bool(b) and a[0] == b[0]) for a, b in zip(t1, t2)), np.float32, len(t1)),
+        "last_tok_eq": np.fromiter((float(bool(a) and bool(b) and a[-1] == b[-1]) for a, b in zip(t1, t2)), np.float32, len(t1)),
+        "tok_count_diff": np.fromiter((abs(len(a) - len(b)) for a, b in zip(t1, t2)), np.float32, len(t1)),
+        "core_contained": np.fromiter((float(bool(a) and bool(b) and (a in b or b in a)) for a, b in zip(k1, k2)), np.float32, len(t1)),
+    }
+
+
+def _acronym_features(n1, n2, k1, k2):
+    """Group C: acronyms ("ucprivate" ~ universal constructions private) and web domains."""
+    def acr(tokens, k):
+        return "".join(t[0] for t in tokens[:k]) if len(tokens) >= k else ""
+
+    def match(core_a, name_b):
+        ta, tb = core_a.split(), name_b.split()
+        for k in (2, 3, 4):
+            a = acr(ta, k)
+            if len(a) >= 2 and any(t.startswith(a) and t != ta[0] for t in tb):
+                return 1.0
+        return 0.0
+
+    n = len(n1)
+    return {
+        "acronym_match": np.fromiter((max(match(a, y), match(b, x)) for a, b, x, y in zip(k1, k2, n1, n2)), np.float32, n),
+        "domain1": np.fromiter((float(bool(set(x.split()) & DOMAIN_TOKENS)) for x in n1), np.float32, n),
+        "domain2": np.fromiter((float(bool(set(y.split()) & DOMAIN_TOKENS)) for y in n2), np.float32, n),
+        "concat_ratio": process.cpdist([a.replace(" ", "") for a in k1], [b.replace(" ", "") for b in k2],
+                                       scorer=fuzz.ratio, workers=-1).astype(np.float32) / 100.0,
+    }
+
+
 def _pairwise(scorer, a, b):
     return process.cpdist(list(a), list(b), scorer=scorer, workers=-1).astype(np.float32) / 100.0
 
@@ -263,6 +334,14 @@ def _chunk_features(s1, tg, c):
     p1 = np.array([_postcode(x) for x in a1], dtype=object)
     p2 = np.array([_postcode(x) for x in a2], dtype=object)
     f["postcode"] = np.where((p1 == "") | (p2 == ""), -1, (p1 == p2).astype(np.float32)).astype(np.float32)
+
+    # Optional feature groups (see FEATURE_GROUPS)
+    if "A" in FEATURE_GROUPS:
+        f.update(_number_decoy_features(a1, a2))
+    if "B" in FEATURE_GROUPS:
+        f.update(_name_structure_features(k1, k2))
+    if "C" in FEATURE_GROUPS:
+        f.update(_acronym_features(n1, n2, k1, k2))
 
     # Context
     f["name_len1"] = np.fromiter((len(x) for x in n1), np.float32, len(i))
