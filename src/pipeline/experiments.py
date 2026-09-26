@@ -274,6 +274,59 @@ def run_stage2_transfer(groups):
             notes=f"stage-1 US {out['stage-1'][0]:.4f} India {out['stage-1'][1]:.4f}")
 
 
+def run_sibling():
+    """Stage-2 with vs without sibling features: inner, bucket-9 holdout, US -> India."""
+    from pipeline.matcher import oof_probs as m_oof, relational as m_rel, sibling_features
+
+    d = Data()
+    tg = Records("train", ["source2", "source3"])
+    cols = d.cols([])
+    b = d.bkt[d.tr["s1"].to_numpy()]
+
+    def stage2_pair(tr, te, tag):
+        """Train stage-1 (+OOF) on tr, evaluate stage-2 variants on te pairs."""
+        s1, y = tr["s1"].to_numpy(), tr["y"].to_numpy()
+        p_oof = m_oof(tr[cols], y, s1, BASE_PARAMS)
+        p_te = fit(tr[cols], y, s1, BASE_PARAMS).predict_proba(te[cols])[:, 1]
+        feats_tr = {"rel": m_rel(tr, p_oof)}
+        feats_te = {"rel": m_rel(te, p_te)}
+        feats_tr["rel+sib"] = pd.concat([feats_tr["rel"], sibling_features(tr, p_oof, tg)], axis=1)
+        feats_te["rel+sib"] = pd.concat([feats_te["rel"], sibling_features(te, p_te, tg)], axis=1)
+        probs = {"stage-1": p_te}
+        for k in ("rel", "rel+sib"):
+            m2 = fit(pd.concat([tr[cols].reset_index(drop=True), feats_tr[k]], axis=1), y, s1, BASE_PARAMS)
+            probs[k] = m2.predict_proba(pd.concat([te[cols].reset_index(drop=True), feats_te[k]], axis=1))[:, 1]
+        print(f"  [{tag}] done", flush=True)
+        return probs
+
+    rows = {}
+    # 1. inner: train buckets 6-7, validate bucket 8
+    tr, va = d.tr[np.isin(b, [6, 7])].reset_index(drop=True), d.tr[b == 8].reset_index(drop=True)
+    probs = stage2_pair(tr, va, "inner")
+    q = np.unique(va["s1"].to_numpy())
+    for k, p in probs.items():
+        rows.setdefault(k, {})["inner"] = best_f05(va[["s1", "tgt"]], p, q, d)[0]
+    # 2. holdout (bucket 9): train on all of 6-8
+    probs = stage2_pair(d.tr.reset_index(drop=True), d.ho.reset_index(drop=True), "holdout")
+    for k, p in probs.items():
+        rows[k]["holdout"] = best_f05(d.ho[["s1", "tgt"]], p, d.hold_q, d)[0]
+    # 3. unseen country: US-only training, India holdout at the US-best threshold
+    us = d.tr[d.ctry[d.tr["s1"].to_numpy()] == "US"].reset_index(drop=True)
+    probs = stage2_pair(us, d.ho.reset_index(drop=True), "transfer")
+    q_us = d.hold_q[d.ctry[d.hold_q] == "US"]
+    q_in = d.hold_q[d.ctry[d.hold_q] == "India"]
+    for k, p in probs.items():
+        us_f, t = best_f05(d.ho[["s1", "tgt"]], p, q_us, d)
+        rows[k]["us"], rows[k]["india"] = us_f, macro_f05(q_in, d.n_true, assign(d.ho[["s1", "tgt"]], p, t), d.pos)
+    for k, r in rows.items():
+        print(f"{k:8s} inner {r['inner']:.4f} | holdout {r['holdout']:.4f} | US {r['us']:.4f} | "
+              f"India transfer {r['india']:.4f}", flush=True)
+        log_row(experiment=f"sibling_{k}", phase="v10-step1", encoder_config="a_alldata",
+                feature_groups="A+B" + ("+D" if k != "stage-1" else "") + ("+sib" if "sib" in k else ""),
+                depth=BASE_PARAMS["max_depth"], learning_rate=BASE_PARAMS["learning_rate"],
+                inner_f05=r["inner"], holdout_f05=r["holdout"], us_f05=r["us"], india_transfer_f05=r["india"])
+
+
 # --------------------------------------------------------------------------
 # Hyperparameter random search
 # --------------------------------------------------------------------------
@@ -327,6 +380,8 @@ if __name__ == "__main__":
         run_groups()
     elif cmd == "stage2":
         run_stage2(groups)
+    elif cmd == "sibling":
+        run_sibling()
     elif cmd == "stage2_transfer":
         run_stage2_transfer(groups)
     elif cmd == "tune":

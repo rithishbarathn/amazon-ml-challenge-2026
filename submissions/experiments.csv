@@ -24,3 +24,6 @@ time,experiment,phase,encoder_config,feature_groups,n_features,depth,learning_ra
 2026-09-26 16:54,tune_11,4-tune,v6,A+B,56,10,0.0420,"{""n_estimators"": 6000, ""min_child_weight"": 5.0, ""subsample"": 0.63, ""colsample_bytree"": 0.82, ""reg_lambda"": 5.16, ""reg_alpha"": 0.16, ""gamma"": 0.5, ""max_bin"": 256}",0.7500,0.9851,,,,,,,,,
 2026-09-26 16:56,blocking_v9_encoder_a,2-blocking,a_alldata,,,,,,,,,,,,,0.9761,,4.8400,holdout recall A<1|B<3 before address channel: v6 0.9724 -> 0.9761 at 4.84 cand/S1; A<1|B<5 0.9772 -> 0.9810 at 5.70; test address channel new pairs 9.44M (v6 10.47M)
 2026-09-26 17:36,v9_final,final,a_alldata,A+B+D,,8,0.0500,,expected floor 0.4 extra 0.3,,0.9867,0.9879,0.9849,0.9501,-0.0181,,,7.5700,v6 France-US cosine gap -0.059; validator PASS
+2026-09-26 19:52,sibling_stage-1,v10-step1,a_alldata,A+B,,8,0.0500,,,0.9856,0.9859,0.9871,,0.9419,,,,,
+2026-09-26 19:52,sibling_rel,v10-step1,a_alldata,A+B+D,,8,0.0500,,,0.9863,0.9866,0.9878,,0.9449,,,,,
+2026-09-26 19:52,sibling_rel+sib,v10-step1,a_alldata,A+B+D+sib,,8,0.0500,,,0.9869,0.9872,0.9882,,0.9479,,,,,

@@ -39,6 +39,8 @@ STAGE1_PATH = WORK_DIR / "matcher_stage1.json"
 MATCHER_PARAMS = dict(n_estimators=6000, learning_rate=0.05, max_depth=8, min_child_weight=5,
                       subsample=0.8, colsample_bytree=0.8)
 STAGE2 = True          # relational second stage on out-of-fold stage-1 probabilities
+SIBLINGS = True        # + similarity to the S1's other confident candidates (v10)
+STAGE2_SEEDS = (0, 1, 2)   # stage-2 models averaged over these seeds (v10)
 OOF_FOLDS = 3
 TRAIN_QUERIES = 10_000_000  # capped at all matcher-bucket S1
 HOLDOUT_QUERIES = 100_000
@@ -100,6 +102,45 @@ def relational(pairs, p):
     return out.astype(np.float32).reset_index(drop=True)
 
 
+def sibling_features(pairs, p, tg, threshold=0.5, chunk=2_000_000):
+    """How much a candidate resembles its S1's OTHER confident candidates.
+
+    All Source 2/3 records of one business are copies of each other, so a
+    candidate that looks unlike its Source 1 record (a trade name, a web
+    domain) can still be rescued when it closely resembles the S1's other
+    confident matches ("siblings": p > threshold, excluding itself).
+    `p` must be out-of-fold for training pairs (see oof_probs).
+    """
+    from rapidfuzz import fuzz, process
+
+    df = pd.DataFrame({"s1": pairs["s1"].to_numpy(), "tgt": pairs["tgt"].to_numpy(),
+                       "row": np.arange(len(pairs))})
+    hi = df.loc[np.asarray(p) > threshold, ["s1", "tgt"]].rename(columns={"tgt": "sib"})
+    combo = df.merge(hi, on="s1")
+    combo = combo[combo["tgt"].to_numpy() != combo["sib"].to_numpy()].reset_index(drop=True)
+    t, sb = combo["tgt"].to_numpy(), combo["sib"].to_numpy()
+    feats = {k: np.empty(len(combo), dtype=np.float32) for k in
+             ("name_cos", "addr_cos", "name_ratio", "addr_ratio")}
+    for i in range(0, len(combo), chunk):
+        e1, e2 = tg.emb(t[i:i + chunk]), tg.emb(sb[i:i + chunk])
+        half = e1.shape[1] // 2
+        feats["name_cos"][i:i + chunk] = (e1[:, :half] * e2[:, :half]).sum(1)
+        feats["addr_cos"][i:i + chunk] = (e1[:, half:] * e2[:, half:]).sum(1)
+        del e1, e2
+        for key, texts, scorer in (("name_ratio", tg.name, fuzz.token_set_ratio),
+                                   ("addr_ratio", tg.addr, fuzz.token_set_ratio)):
+            feats[key][i:i + chunk] = process.cpdist(
+                list(texts[t[i:i + chunk]]), list(texts[sb[i:i + chunk]]),
+                scorer=scorer, workers=-1).astype(np.float32) / 100.0
+    agg = pd.DataFrame(feats).assign(row=combo["row"].to_numpy()).groupby("row")
+    out = pd.DataFrame(index=np.arange(len(pairs)))
+    out["sib_n"] = agg.size().reindex(out.index, fill_value=0).astype(np.float32)
+    for k in feats:
+        out[f"sib_max_{k}"] = agg[k].max().reindex(out.index, fill_value=-1.0)
+    out["sib_mean_name_cos"] = agg["name_cos"].mean().reindex(out.index, fill_value=-1.0)
+    return out.astype(np.float32).reset_index(drop=True)
+
+
 def fit_xgb(X, y, s1, params=None, seed=0, verbose=False):
     """XGBoost with early stopping on a 10% validation split grouped by S1."""
     rng = np.random.default_rng(seed)
@@ -123,6 +164,17 @@ def oof_probs(X, y, s1, params=None, folds=OOF_FOLDS, seed=0):
         p[te] = fit_xgb(X[~te], y[~te], s1[~te], params, seed=seed + k).predict_proba(X[te])[:, 1]
         print(f"  OOF fold {k}: {te.sum():,} pairs", flush=True)
     return p
+
+
+def stage2_features(pairs, p, tg):
+    feats = relational(pairs, p)
+    if SIBLINGS:
+        feats = pd.concat([feats, sibling_features(pairs, p, tg)], axis=1)
+    return feats
+
+
+def seed_path(seed):
+    return MODEL_PATH if seed == 0 else MODEL_PATH.with_name(f"{MODEL_PATH.stem}_seed{seed}.json")
 
 
 def pair_keys(cand):
@@ -229,11 +281,14 @@ def train():
     model = stage1
     if STAGE2:
         p_oof = oof_probs(X_tr, y_tr, s1_tr)
-        X_tr = pd.concat([X_tr.reset_index(drop=True), relational(tr, p_oof)], axis=1)
-        X_ho = pd.concat([X_ho.reset_index(drop=True), relational(ho, prob)], axis=1)
+        X_tr = pd.concat([X_tr.reset_index(drop=True), stage2_features(tr, p_oof, tg)], axis=1)
+        X_ho = pd.concat([X_ho.reset_index(drop=True), stage2_features(ho, prob, tg)], axis=1)
         stage1.save_model(STAGE1_PATH)
-        model = fit_xgb(X_tr, y_tr, s1_tr, verbose=True)
-        prob = model.predict_proba(X_ho)[:, 1]
+        models = [fit_xgb(X_tr, y_tr, s1_tr, seed=sd, verbose=(sd == 0)) for sd in STAGE2_SEEDS]
+        for sd, m in zip(STAGE2_SEEDS, models):
+            m.save_model(seed_path(sd))
+        model = models[0]
+        prob = np.mean([m.predict_proba(X_ho)[:, 1] for m in models], axis=0)
     print(f"best iteration {model.best_iteration}; holdout mean p pos "
           f"{prob[y_ho == 1].mean():.3f} neg {prob[y_ho == 0].mean():.3f}")
 
@@ -247,6 +302,7 @@ def train():
     CONFIG_PATH.write_text(json.dumps({
         "features": [c for c in X_tr.columns if not c.startswith("r_")],
         "stage2": STAGE2, "stage2_features": list(X_tr.columns), "params": MATCHER_PARAMS,
+        "stage2_seeds": list(STAGE2_SEEDS) if STAGE2 else [0], "siblings": SIBLINGS,
     }, indent=2))
     print(f"saved model ({time.time() - start:.0f}s)")
     tune(s1, tg, positives, n_true)
@@ -359,9 +415,15 @@ def predict():
             del chunks
             p1 = np.concatenate([stage1.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
                                  for i in range(0, len(X), 2_000_000)])
-            X = pd.concat([X, relational(cand, p1)], axis=1)[config["stage2_features"]]
-            prob = np.concatenate([model.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
-                                   for i in range(0, len(X), 2_000_000)]).astype(np.float32)
+            X = pd.concat([X, stage2_features(cand, p1, tg)], axis=1)[config["stage2_features"]]
+            prob = np.zeros(len(X), dtype=np.float32)
+            seeds = config.get("stage2_seeds", [0])
+            for sd in seeds:
+                m = xgb.XGBClassifier()
+                m.load_model(seed_path(sd))
+                m.set_params(device="cuda")
+                prob += np.concatenate([m.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
+                                        for i in range(0, len(X), 2_000_000)]).astype(np.float32) / len(seeds)
             del X
         else:
             prob = np.empty(len(cand), dtype=np.float32)
