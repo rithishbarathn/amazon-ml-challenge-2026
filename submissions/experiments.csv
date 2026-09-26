@@ -27,3 +27,4 @@ time,experiment,phase,encoder_config,feature_groups,n_features,depth,learning_ra
 2026-09-26 19:52,sibling_stage-1,v10-step1,a_alldata,A+B,,8,0.0500,,,0.9856,0.9859,0.9871,,0.9419,,,,,
 2026-09-26 19:52,sibling_rel,v10-step1,a_alldata,A+B+D,,8,0.0500,,,0.9863,0.9866,0.9878,,0.9449,,,,,
 2026-09-26 19:52,sibling_rel+sib,v10-step1,a_alldata,A+B+D+sib,,8,0.0500,,,0.9869,0.9872,0.9882,,0.9479,,,,,
+2026-09-26 21:00,v10_final,final,a_alldata,A+B+D+sib,,8,0.0500,,expected floor 0.2 extra 0.05,,0.9873,0.9884,0.9858,0.9479,,,,7.5700,"stage-2 + sibling features, 3-seed average; validator PASS"

@@ -58,3 +58,4 @@ Offline evidence per component (all in `submissions/experiments.csv`):
 - US-only model scored on India (unseen-country check): base 0.9352 -> +A+B 0.9461 -> +stage-2 0.9501.
 - Stage-2 leakage check: inner +0.06, bucket-9 holdout +0.08 (consistent).
 - Rejected: hard-negative encoder batches (no gain), group C acronym/domain (unseen India -0.35), XGBoost random search (10 trials, none beat depth 8 / lr 0.05).
+| v10 | 0794fe7 | 0.9873 (India 0.9858, US 0.9884) | - | 7.57 | v9 + sibling features (similarity to the S1's other confident candidates, out-of-fold) + 3-seed stage-2 average; expected-F0.5 rule (floor 0.2, extra 0.05). Sibling experiment: holdout 0.9866 -> 0.9872, unseen India 0.9449 -> 0.9479. |
