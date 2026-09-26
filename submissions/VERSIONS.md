@@ -47,3 +47,14 @@ India (unseen) 0.9376 -> 0.9331 (-0.45); cross-encoder alone on India 0.8813.
 Not used: it hurts transfer to a country without training labels (France).
 Encoder-feature ablation (same setup): raw 0.9392, within-country percentiles
 0.9360, no encoder features 0.8636 -> encoder features carry the transfer.
+
+## v9 (branch `encoder-v2`)
+
+| Version | Code | Holdout macro F0.5 | Leaderboard | Cand/S1 (test) | Changes |
+|---|---|---|---|---|---|
+| v9 | (this commit) | 0.9867 (India 0.9849, US 0.9879) | - | 7.57 | Encoder trained on all 1.25M bucket 0-5 S1 (was 200K): owner@1 0.9703 -> 0.9741, blocking recall 97.24% -> 97.61% at the same 4.84 cand/S1. Feature groups A (number decoys) + B (name structure). Stage-2 relational XGBoost on out-of-fold stage-1 probabilities (folds by S1). Expected-F0.5 decision rule (floor 0.4, extra 0.3). France-US top-1 cosine gap -0.059 -> -0.018. |
+
+Offline evidence per component (all in `submissions/experiments.csv`):
+- US-only model scored on India (unseen-country check): base 0.9352 -> +A+B 0.9461 -> +stage-2 0.9501.
+- Stage-2 leakage check: inner +0.06, bucket-9 holdout +0.08 (consistent).
+- Rejected: hard-negative encoder batches (no gain), group C acronym/domain (unseen India -0.35), XGBoost random search (10 trials, none beat depth 8 / lr 0.05).
