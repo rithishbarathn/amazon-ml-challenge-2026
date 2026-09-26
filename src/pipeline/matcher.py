@@ -41,6 +41,7 @@ MATCHER_PARAMS = dict(n_estimators=6000, learning_rate=0.05, max_depth=8, min_ch
 STAGE2 = True          # relational second stage on out-of-fold stage-1 probabilities
 SIBLINGS = True        # + similarity to the S1's other confident candidates (v10)
 STAGE2_SEEDS = (0, 1, 2)   # stage-2 models averaged over these seeds (v10)
+STAGE2_PREFIXES = ("r_", "sib_")   # columns produced by stage2_features
 OOF_FOLDS = 3
 TRAIN_QUERIES = 10_000_000  # capped at all matcher-bucket S1
 HOLDOUT_QUERIES = 100_000
@@ -102,7 +103,26 @@ def relational(pairs, p):
     return out.astype(np.float32).reset_index(drop=True)
 
 
-def sibling_features(pairs, p, tg, threshold=0.5, chunk=2_000_000):
+def sibling_features(pairs, p, tg, threshold=0.5, block_pairs=3_000_000):
+    """Blockwise wrapper: S1s are split into blocks so the candidate x sibling
+    combinations (~3-4 per pair) never have to fit in memory all at once."""
+    s1 = pairs["s1"].to_numpy()
+    n_blocks = max(1, int(np.ceil(len(pairs) / block_pairs)))
+    if n_blocks == 1:
+        return _sibling_block(pairs, p, tg, threshold)
+    block = s1 % n_blocks
+    out = pd.DataFrame(index=np.arange(len(pairs)), dtype=np.float32)
+    parts = []
+    for k in range(n_blocks):
+        rows = np.flatnonzero(block == k)
+        f = _sibling_block(pairs.iloc[rows].reset_index(drop=True), np.asarray(p)[rows], tg, threshold)
+        f.index = rows
+        parts.append(f)
+        print(f"  sibling features block {k + 1}/{n_blocks}", flush=True)
+    return pd.concat(parts).sort_index().reset_index(drop=True)
+
+
+def _sibling_block(pairs, p, tg, threshold=0.5, chunk=2_000_000):
     """How much a candidate resembles its S1's OTHER confident candidates.
 
     All Source 2/3 records of one business are copies of each other, so a
@@ -300,7 +320,7 @@ def train():
     ho.assign(p=prob, y=y_ho)[["s1", "tgt", "rank_a", "rank_b", "rank_c", "p", "y"]].to_parquet(HOLDOUT_PRED)
     np.save(HOLDOUT_QUERIES_PATH, hold_q)
     CONFIG_PATH.write_text(json.dumps({
-        "features": [c for c in X_tr.columns if not c.startswith("r_")],
+        "features": [c for c in X_tr.columns if not c.startswith(STAGE2_PREFIXES)],
         "stage2": STAGE2, "stage2_features": list(X_tr.columns), "params": MATCHER_PARAMS,
         "stage2_seeds": list(STAGE2_SEEDS) if STAGE2 else [0], "siblings": SIBLINGS,
     }, indent=2))
