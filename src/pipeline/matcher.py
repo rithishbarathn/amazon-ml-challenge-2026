@@ -14,6 +14,7 @@ Usage (from src/):
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -56,6 +57,14 @@ def load_truth(s1_ids, tg_ids):
     n_true = np.zeros(len(s1_ids), dtype=np.int32)
     np.add.at(n_true, s, 1)
     return np.unique((s << 32) | t), n_true
+
+
+def with_ce(cand, split):
+    """Attach cross-encoder scores when enabled (ER_USE_CE=1, tag ER_CE_TAG)."""
+    if os.environ.get("ER_USE_CE") != "1":
+        return cand
+    from pipeline.crossenc import attach_scores
+    return attach_scores(cand, split, os.environ.get("ER_CE_TAG", "all"))
 
 
 def pair_keys(cand):
@@ -130,7 +139,7 @@ def train():
     tg = Records("train", ["source2", "source3"])
     print(f"records loaded ({time.time() - start:.0f}s)", flush=True)
     positives, n_true = load_truth(s1.ids, tg.ids)
-    cand = filter_candidates(load_candidates("train"))
+    cand = with_ce(filter_candidates(load_candidates("train")), "train")
     print(f"train candidates: {len(cand):,}", flush=True)
 
     rng = np.random.default_rng(0)
@@ -273,7 +282,7 @@ def predict():
 
     s1 = Records("test", ["source1"])
     tg = Records("test", ["source2", "source3"])
-    cand = filter_candidates(load_candidates("test"))
+    cand = with_ce(filter_candidates(load_candidates("test")), "test")
     print(f"test candidates: {len(cand):,} ({len(cand) / len(s1.ids):.2f} per S1)", flush=True)
 
     if len(sys.argv) > 2 and sys.argv[2] == "--reuse-prob":

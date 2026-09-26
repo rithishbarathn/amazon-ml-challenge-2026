@@ -36,3 +36,14 @@ Other offline checks on the same US -> India setup: self-training on confident
 pseudo-labels +0.5 on the unseen country (not used: small overall gain and it
 trains on unlabelled test records); shallower trees and dropping length /
 postcode features all transferred worse than the submitted configuration.
+
+## Experiment (not submitted): cross-encoder (branch `cross-encoder`)
+
+`pipeline.crossenc` fine-tunes multilingual-e5-small as a pair classifier on
+raw "name · address" pairs (buckets 0-5 only) and adds its probability as an
+XGBoost feature (opt-in `ER_USE_CE=1`). Unseen-country check with a US-only
+cross-encoder (300k pairs) and US-only matcher: US 0.9857 -> 0.9878 (+0.21),
+India (unseen) 0.9376 -> 0.9331 (-0.45); cross-encoder alone on India 0.8813.
+Not used: it hurts transfer to a country without training labels (France).
+Encoder-feature ablation (same setup): raw 0.9392, within-country percentiles
+0.9360, no encoder features 0.8636 -> encoder features carry the transfer.

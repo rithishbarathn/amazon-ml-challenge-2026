@@ -194,6 +194,8 @@ def _chunk_features(s1, tg, c):
     f["rank_b"] = c["rank_b"].to_numpy().astype(np.float32)
     f["rank_c"] = c["rank_c"].to_numpy().astype(np.float32)
     f["addr_nn_cos"] = c["addr_nn_cos"].to_numpy().astype(np.float32)
+    if "ce" in c.columns:  # cross-encoder probability (pipeline.crossenc, ER_USE_CE=1)
+        f["ce"] = c["ce"].to_numpy().astype(np.float32)
     f["t_top1"] = c["t_top1"].to_numpy()
     f["t_top2"] = c["t_top2"].to_numpy()
     f["s_top1"] = c["s_top1"].to_numpy()
