@@ -430,21 +430,25 @@ def predict():
             stage1 = xgb.XGBClassifier()
             stage1.load_model(STAGE1_PATH)
             stage1.set_params(device="cuda")
-            chunks = [feats[config["features"]] for _, feats in iter_features(s1, tg, cand)]
-            X = pd.concat(chunks, ignore_index=True)
-            del chunks
-            p1 = np.concatenate([stage1.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
-                                 for i in range(0, len(X), 2_000_000)])
-            X = pd.concat([X, stage2_features(cand, p1, tg)], axis=1)[config["stage2_features"]]
-            prob = np.zeros(len(X), dtype=np.float32)
+            # Low-memory, two-pass scoring: no table of all pairs is ever held.
+            base_cols, all_cols = config["features"], config["stage2_features"]
+            p1 = np.empty(len(cand), dtype=np.float32)
+            for begin, feats in iter_features(s1, tg, cand):          # pass 1: stage-1
+                p1[begin:begin + len(feats)] = stage1.predict_proba(feats[base_cols])[:, 1]
+            extra = stage2_features(cand, p1, tg)                     # small: ~13 columns
             seeds = config.get("stage2_seeds", [0])
+            models = []
             for sd in seeds:
                 m = xgb.XGBClassifier()
                 m.load_model(seed_path(sd))
                 m.set_params(device="cuda")
-                prob += np.concatenate([m.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
-                                        for i in range(0, len(X), 2_000_000)]).astype(np.float32) / len(seeds)
-            del X
+                models.append(m)
+            prob = np.zeros(len(cand), dtype=np.float32)
+            for begin, feats in iter_features(s1, tg, cand):          # pass 2: stage-2
+                X = pd.concat([feats[base_cols].reset_index(drop=True),
+                               extra.iloc[begin:begin + len(feats)].reset_index(drop=True)], axis=1)[all_cols]
+                prob[begin:begin + len(feats)] = np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+            del extra
         else:
             prob = np.empty(len(cand), dtype=np.float32)
             for begin, feats in iter_features(s1, tg, cand):

@@ -25,7 +25,7 @@ from rapidfuzz.distance import JaroWinkler, Levenshtein
 from pipeline.common import core_name, emb_path, prep_path, squash
 from pipeline.mlemb import mlemb_path
 
-PAIR_CHUNK = 2_000_000
+PAIR_CHUNK = 1_000_000   # pairs featurised at once (bounds peak RAM)
 
 # Optional feature groups (experiments; ER_FEATURE_GROUPS="A,B,C"):
 #   A number decoys, B name structure, C acronym / domain names.
@@ -36,7 +36,7 @@ DOMAIN_TOKENS = {"com", "net", "org", "in", "co", "fr", "biz", "info", "io"}
 # Final blocking cut-off applied to the saved search results
 # (chosen on the training holdout with `python -m pipeline.block eval`).
 KEEP_A = 1
-KEEP_B = 3
+KEEP_B = 7
 KEEP_C = 1   # address-only channel (pipeline.block addr); ignored if not computed
 
 

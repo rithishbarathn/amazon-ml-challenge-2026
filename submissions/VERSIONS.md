@@ -59,3 +59,4 @@ Offline evidence per component (all in `submissions/experiments.csv`):
 - Stage-2 leakage check: inner +0.06, bucket-9 holdout +0.08 (consistent).
 - Rejected: hard-negative encoder batches (no gain), group C acronym/domain (unseen India -0.35), XGBoost random search (10 trials, none beat depth 8 / lr 0.05).
 | v10 | 0794fe7 | 0.9873 (India 0.9858, US 0.9884) | - | 7.57 | v9 + sibling features (similarity to the S1's other confident candidates, out-of-fold) + 3-seed stage-2 average; expected-F0.5 rule (floor 0.2, extra 0.05). Sibling experiment: holdout 0.9866 -> 0.9872, unseen India 0.9449 -> 0.9479. |
+| v11 | (this commit) | 0.9878 (India 0.9868, US 0.9884) | - | 9.43 | v10 with the second search widened (KEEP_B 3 -> 7): holdout blocking recall 98.01% -> 98.78% at 8.35 cand/S1. Low-memory two-pass prediction. |
