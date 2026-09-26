@@ -249,6 +249,31 @@ def run_stage2(groups, confirm_holdout=True):
             notes=f"stage-1 inner {s1_only:.4f}; holdout stage-1 {hold1} -> stage-2 {hold2}")
 
 
+def run_stage2_transfer(groups):
+    """Unseen-country check for stage-2: US-only stage-1 (OOF) + stage-2, scored on India."""
+    d = Data()
+    d.add_groups(groups)
+    cols = d.cols(groups)
+    us = d.tr[d.ctry[d.tr["s1"].to_numpy()] == "US"].reset_index(drop=True)
+    s1_us, y_us = us["s1"].to_numpy(), us["y"].to_numpy()
+    p_oof = oof_probs(us[cols], y_us, s1_us, BASE_PARAMS)
+    m1 = fit(us[cols], y_us, s1_us, BASE_PARAMS)
+    m2 = fit(pd.concat([us[cols], relational(us, p_oof)], axis=1), y_us, s1_us, BASE_PARAMS)
+    p1 = m1.predict_proba(d.ho[cols])[:, 1]
+    p2 = m2.predict_proba(pd.concat([d.ho[cols].reset_index(drop=True), relational(d.ho, p1)], axis=1))[:, 1]
+    pairs = d.ho[["s1", "tgt"]]
+    q_us = d.hold_q[d.ctry[d.hold_q] == "US"]
+    q_in = d.hold_q[d.ctry[d.hold_q] == "India"]
+    out = {}
+    for tag, p in (("stage-1", p1), ("stage-2", p2)):
+        us_f, t = best_f05(pairs, p, q_us, d)
+        out[tag] = (us_f, macro_f05(q_in, d.n_true, assign(pairs, p, t), d.pos))
+        print(f"{tag}: US {out[tag][0]:.4f} | India transfer {out[tag][1]:.4f}", flush=True)
+    log_row(experiment=f"stage2_transfer_{'+'.join(groups)}", phase="3-stage2", encoder_config="v6",
+            feature_groups="+".join(groups) + "+D", us_f05=out["stage-2"][0], india_transfer_f05=out["stage-2"][1],
+            notes=f"stage-1 US {out['stage-1'][0]:.4f} India {out['stage-1'][1]:.4f}")
+
+
 # --------------------------------------------------------------------------
 # Hyperparameter random search
 # --------------------------------------------------------------------------
@@ -302,5 +327,7 @@ if __name__ == "__main__":
         run_groups()
     elif cmd == "stage2":
         run_stage2(groups)
+    elif cmd == "stage2_transfer":
+        run_stage2_transfer(groups)
     elif cmd == "tune":
         run_tune(groups, int(sys.argv[3]) if len(sys.argv) > 3 else 20)

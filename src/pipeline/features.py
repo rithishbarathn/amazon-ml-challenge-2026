@@ -29,7 +29,8 @@ PAIR_CHUNK = 2_000_000
 
 # Optional feature groups (experiments; ER_FEATURE_GROUPS="A,B,C"):
 #   A number decoys, B name structure, C acronym / domain names.
-FEATURE_GROUPS = set(filter(None, os.environ.get("ER_FEATURE_GROUPS", "").split(",")))
+# A+B are on by default (Phase 3: inner +0.10, unseen-country +1.09); C hurt transfer.
+FEATURE_GROUPS = set(filter(None, os.environ.get("ER_FEATURE_GROUPS", "A,B").split(",")))
 DOMAIN_TOKENS = {"com", "net", "org", "in", "co", "fr", "biz", "info", "io"}
 
 # Final blocking cut-off applied to the saved search results

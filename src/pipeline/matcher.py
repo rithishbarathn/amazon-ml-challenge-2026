@@ -33,6 +33,13 @@ HOLDOUT_PRED = WORK_DIR / "holdout_pred.parquet"
 HOLDOUT_QUERIES_PATH = WORK_DIR / "holdout_queries.npy"
 TEST_PROB = WORK_DIR / "test_prob.npy"
 FEATURE_CACHE = WORK_DIR / "features"
+STAGE1_PATH = WORK_DIR / "matcher_stage1.json"
+# XGBoost settings for both stages. The Phase 4 random search found no setting
+# better than these on the inner split (submissions/experiments.csv, tune_*).
+MATCHER_PARAMS = dict(n_estimators=6000, learning_rate=0.05, max_depth=8, min_child_weight=5,
+                      subsample=0.8, colsample_bytree=0.8)
+STAGE2 = True          # relational second stage on out-of-fold stage-1 probabilities
+OOF_FOLDS = 3
 TRAIN_QUERIES = 10_000_000  # capped at all matcher-bucket S1
 HOLDOUT_QUERIES = 100_000
 THRESHOLDS = np.round(np.arange(0.30, 0.96, 0.025), 3)
@@ -65,6 +72,57 @@ def with_ce(cand, split):
         return cand
     from pipeline.crossenc import attach_scores
     return attach_scores(cand, split, os.environ.get("ER_CE_TAG", "all"))
+
+
+# --------------------------------------------------------------------------
+# Stage 2: relational features from stage-1 probabilities
+# --------------------------------------------------------------------------
+
+def relational(pairs, p):
+    """Features of a pair relative to its S1's other candidates and its target's other owners."""
+    df = pd.DataFrame({"s1": pairs["s1"].to_numpy(), "tgt": pairs["tgt"].to_numpy(),
+                       "p": np.asarray(p, dtype=np.float32)})
+    df["hi"] = (df["p"] > 0.5).astype(np.float32)
+    g1, gt = df.groupby("s1"), df.groupby("tgt")
+    out = pd.DataFrame(index=df.index)
+    out["r_p"] = df["p"]
+    out["r_rank_s1"] = g1["p"].rank(ascending=False, method="first")
+    out["r_max_s1"] = g1["p"].transform("max")
+    out["r_n50_s1"] = g1["hi"].transform("sum")
+    out["r_share_s1"] = df["p"] / (g1["p"].transform("sum") + 1e-6)
+    # Best competing owner of the same target: the target's top p, or its
+    # second-best p when this pair is the top one.
+    rank_t = gt["p"].rank(ascending=False, method="first")
+    top1 = gt["p"].transform("max")
+    second = df["p"].where(rank_t == 2).groupby(df["tgt"]).transform("max").fillna(0.0)
+    out["r_minus_best_other_owner"] = df["p"] - np.where(rank_t == 1, second, top1)
+    out["r_n50_tgt"] = gt["hi"].transform("sum")
+    return out.astype(np.float32).reset_index(drop=True)
+
+
+def fit_xgb(X, y, s1, params=None, seed=0, verbose=False):
+    """XGBoost with early stopping on a 10% validation split grouped by S1."""
+    rng = np.random.default_rng(seed)
+    u = np.unique(s1)
+    v = np.isin(s1, rng.choice(u, max(1, len(u) // 10), replace=False))
+    model = xgb.XGBClassifier(**(params or MATCHER_PARAMS), tree_method="hist", device="cuda",
+                              eval_metric="logloss", early_stopping_rounds=50, random_state=seed)
+    model.fit(X[~v], y[~v], eval_set=[(X[v], y[v])], verbose=200 if verbose else False)
+    return model
+
+
+def oof_probs(X, y, s1, params=None, folds=OOF_FOLDS, seed=0):
+    """Out-of-fold stage-1 probabilities; folds are split by S1, never by pair,
+    so no pair's relational features are built from a model that saw its label."""
+    rng = np.random.default_rng(seed)
+    u = np.unique(s1)
+    fold_of = pd.Series(rng.integers(0, folds, len(u)), index=u).loc[s1].to_numpy()
+    p = np.empty(len(y), dtype=np.float32)
+    for k in range(folds):
+        te = fold_of == k
+        p[te] = fit_xgb(X[~te], y[~te], s1[~te], params, seed=seed + k).predict_proba(X[te])[:, 1]
+        print(f"  OOF fold {k}: {te.sum():,} pairs", flush=True)
+    return p
 
 
 def pair_keys(cand):
@@ -164,17 +222,18 @@ def train():
     print(f"train pairs {len(tr):,} (pos {y_tr.mean():.3f}), holdout pairs {len(ho):,} "
           f"({time.time() - start:.0f}s)", flush=True)
 
-    # Early-stopping split grouped by S1.
-    valid_mask = np.isin(tr["s1"].to_numpy(), train_q[: len(train_q) // 10])
-    model = xgb.XGBClassifier(
-        n_estimators=12000, learning_rate=0.03, max_depth=10, min_child_weight=5,
-        subsample=0.8, colsample_bytree=0.8, tree_method="hist", device="cuda",
-        eval_metric="logloss", early_stopping_rounds=50, random_state=0,
-    )
-    model.fit(X_tr[~valid_mask], y_tr[~valid_mask],
-              eval_set=[(X_tr[valid_mask], y_tr[valid_mask])], verbose=200)
-
-    prob = model.predict_proba(X_ho)[:, 1]
+    s1_tr = tr["s1"].to_numpy()
+    stage1 = fit_xgb(X_tr, y_tr, s1_tr, verbose=True)
+    prob = stage1.predict_proba(X_ho)[:, 1]
+    print(f"stage-1 best iteration {stage1.best_iteration}", flush=True)
+    model = stage1
+    if STAGE2:
+        p_oof = oof_probs(X_tr, y_tr, s1_tr)
+        X_tr = pd.concat([X_tr.reset_index(drop=True), relational(tr, p_oof)], axis=1)
+        X_ho = pd.concat([X_ho.reset_index(drop=True), relational(ho, prob)], axis=1)
+        stage1.save_model(STAGE1_PATH)
+        model = fit_xgb(X_tr, y_tr, s1_tr, verbose=True)
+        prob = model.predict_proba(X_ho)[:, 1]
     print(f"best iteration {model.best_iteration}; holdout mean p pos "
           f"{prob[y_ho == 1].mean():.3f} neg {prob[y_ho == 0].mean():.3f}")
 
@@ -185,7 +244,10 @@ def train():
     # Keep holdout predictions so decision rules can be re-tuned without retraining.
     ho.assign(p=prob, y=y_ho)[["s1", "tgt", "rank_a", "rank_b", "rank_c", "p", "y"]].to_parquet(HOLDOUT_PRED)
     np.save(HOLDOUT_QUERIES_PATH, hold_q)
-    CONFIG_PATH.write_text(json.dumps({"features": list(X_tr.columns)}, indent=2))
+    CONFIG_PATH.write_text(json.dumps({
+        "features": [c for c in X_tr.columns if not c.startswith("r_")],
+        "stage2": STAGE2, "stage2_features": list(X_tr.columns), "params": MATCHER_PARAMS,
+    }, indent=2))
     print(f"saved model ({time.time() - start:.0f}s)")
     tune(s1, tg, positives, n_true)
 
@@ -288,9 +350,23 @@ def predict():
     if len(sys.argv) > 2 and sys.argv[2] == "--reuse-prob":
         prob = np.load(TEST_PROB)
     else:
-        prob = np.empty(len(cand), dtype=np.float32)
-        for begin, feats in iter_features(s1, tg, cand):
-            prob[begin:begin + len(feats)] = model.predict_proba(feats[config["features"]])[:, 1]
+        if config.get("stage2"):
+            stage1 = xgb.XGBClassifier()
+            stage1.load_model(STAGE1_PATH)
+            stage1.set_params(device="cuda")
+            chunks = [feats[config["features"]] for _, feats in iter_features(s1, tg, cand)]
+            X = pd.concat(chunks, ignore_index=True)
+            del chunks
+            p1 = np.concatenate([stage1.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
+                                 for i in range(0, len(X), 2_000_000)])
+            X = pd.concat([X, relational(cand, p1)], axis=1)[config["stage2_features"]]
+            prob = np.concatenate([model.predict_proba(X.iloc[i:i + 2_000_000])[:, 1]
+                                   for i in range(0, len(X), 2_000_000)]).astype(np.float32)
+            del X
+        else:
+            prob = np.empty(len(cand), dtype=np.float32)
+            for begin, feats in iter_features(s1, tg, cand):
+                prob[begin:begin + len(feats)] = model.predict_proba(feats[config["features"]])[:, 1]
         np.save(TEST_PROB, prob)
 
     rule = config.get("rule", {"mode": "threshold", "threshold": config.get("threshold")})
