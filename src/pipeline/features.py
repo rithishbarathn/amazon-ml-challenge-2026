@@ -14,6 +14,7 @@ Nothing here depends on the country label, so the model transfers to
 countries that are absent from training (France).
 """
 
+import os
 import re
 
 import numpy as np
@@ -22,6 +23,7 @@ from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 from pipeline.common import core_name, emb_path, prep_path, squash
+from pipeline.mlemb import mlemb_path
 
 PAIR_CHUNK = 2_000_000
 
@@ -62,6 +64,17 @@ class Records:
         del df
         self.embs = [np.load(emb_path(split, s), mmap_mode="r") for s in sources]
         self.source = np.concatenate([np.full(n, i, dtype=np.int8) for i, n in enumerate(self.sizes)])
+        # Multilingual embeddings (pipeline.mlemb). Opt-in with ER_USE_MLEMB=1: they did not
+        # help the holdout (0.9847 -> 0.9850) and hurt transfer to an unseen country
+        # (US-only model on India 0.9392 -> 0.9346), so the submitted model does not use them.
+        self.ml = {}
+        for field in (("name", "addr") if os.environ.get("ER_USE_MLEMB") == "1" else ()):
+            paths = [mlemb_path(split, s, field) for s in sources]
+            if all(p.exists() for p in paths):
+                arrays = [np.load(p, mmap_mode="r") for p in paths]
+                if [len(a) for a in arrays] != self.sizes:
+                    raise ValueError(f"mlemb {field} rows do not match prep for {split}")
+                self.ml[field] = arrays
         self._idf = None
         self._addr_idf = None
 
@@ -82,10 +95,11 @@ class Records:
         """IDF of a token seen once (unseen tokens are treated as rarest)."""
         return float(np.log(len(self.name)))
 
-    def emb(self, rows):
-        out = np.empty((len(rows), self.embs[0].shape[1]), dtype=np.float32)
+    def emb(self, rows, arrays=None):
+        arrays = self.embs if arrays is None else arrays
+        out = np.empty((len(rows), arrays[0].shape[1]), dtype=np.float32)
         start = 0
-        for e in self.embs:
+        for e in arrays:
             mask = (rows >= start) & (rows < start + len(e))
             if mask.any():
                 sub = rows[mask] - start
@@ -193,6 +207,17 @@ def _chunk_features(s1, tg, c):
     half = e1.shape[1] // 2
     f["name_cos"] = (e1[:, :half] * e2[:, :half]).sum(1)
     f["addr_cos"] = (e1[:, half:] * e2[:, half:]).sum(1)
+    del e1, e2
+
+    # Multilingual embedding cosines on the raw text (Indic scripts, French)
+    for field in ("name", "addr"):
+        if field in s1.ml and field in tg.ml:
+            f[f"ml_{field}_cos"] = (s1.emb(i, s1.ml[field]) * tg.emb(j, tg.ml[field])).sum(1)
+    if "name" in s1.ml and "addr" in tg.ml:
+        # Name written into the other record's address field (and vice versa)
+        f["ml_cross_cos"] = np.maximum(
+            (s1.emb(i, s1.ml["name"]) * tg.emb(j, tg.ml["addr"])).sum(1),
+            (s1.emb(i, s1.ml["addr"]) * tg.emb(j, tg.ml["name"])).sum(1))
 
     # String similarity
     n1, n2 = s1.name[i], tg.name[j]

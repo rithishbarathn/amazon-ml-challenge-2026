@@ -31,6 +31,7 @@ CONFIG_PATH = WORK_DIR / "matcher_config.json"
 HOLDOUT_PRED = WORK_DIR / "holdout_pred.parquet"
 HOLDOUT_QUERIES_PATH = WORK_DIR / "holdout_queries.npy"
 TEST_PROB = WORK_DIR / "test_prob.npy"
+FEATURE_CACHE = WORK_DIR / "features"
 TRAIN_QUERIES = 10_000_000  # capped at all matcher-bucket S1
 HOLDOUT_QUERIES = 100_000
 THRESHOLDS = np.round(np.arange(0.30, 0.96, 0.025), 3)
@@ -147,6 +148,10 @@ def train():
     y_tr = np.isin(pair_keys(tr), positives).astype(np.int8)
     X_ho = build_features(s1, tg, ho)
     y_ho = np.isin(pair_keys(ho), positives).astype(np.int8)
+    # Cache features so model variants / ensembles can be tried without re-featurising.
+    FEATURE_CACHE.mkdir(parents=True, exist_ok=True)
+    X_tr.assign(y=y_tr, s1=tr["s1"].to_numpy()).to_parquet(FEATURE_CACHE / "train.parquet")
+    X_ho.assign(y=y_ho).to_parquet(FEATURE_CACHE / "holdout.parquet")
     print(f"train pairs {len(tr):,} (pos {y_tr.mean():.3f}), holdout pairs {len(ho):,} "
           f"({time.time() - start:.0f}s)", flush=True)
 

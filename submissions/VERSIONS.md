@@ -21,3 +21,18 @@ only scores 1 for true singletons (~5.5%, as in US / India). Solving
 0.842 = 0.850 * U + 0.150 * 0.055 and 0.97509 = 0.850 * U + 0.150 * F gives
 **US + India ~ 0.981** and **France ~ 0.944** on the public leaderboard
 (France range 0.92-0.97 for a 3-8% singleton rate).
+
+## Experiment (not submitted): v8 multilingual embeddings
+
+`pipeline.mlemb` embeds raw names / addresses with intfloat/multilingual-e5-small
+(MIT, 118M params), PCA to 128-d, and adds ml_name_cos / ml_addr_cos /
+ml_cross_cos features (opt-in via `ER_USE_MLEMB=1`).
+Holdout 0.9850 vs v6 0.9847 (India 0.9826, US 0.9866) - the model barely uses
+them. Cross-country check (train on US only, score India as unseen country):
+0.9392 without -> 0.9346 with, i.e. they *hurt* transfer to an unseen country,
+so they were not used for the France-containing test set.
+
+Other offline checks on the same US -> India setup: self-training on confident
+pseudo-labels +0.5 on the unseen country (not used: small overall gain and it
+trains on unlabelled test records); shallower trees and dropping length /
+postcode features all transferred worse than the submitted configuration.
